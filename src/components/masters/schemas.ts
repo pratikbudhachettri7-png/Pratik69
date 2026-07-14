@@ -1,0 +1,180 @@
+import { z } from "zod";
+import type { FieldDef } from "./MasterForm";
+
+const opt = z.string().trim().optional().or(z.literal("").transform(() => undefined));
+
+export const companySchema = z.object({
+  name: z.string().trim().min(1, "Name required").max(200),
+  vat_number: opt,
+  pan: opt,
+  address: opt,
+  state: opt,
+  city: opt,
+  pincode: opt,
+  phone: opt,
+  email: z.string().email().optional().or(z.literal("").transform(() => undefined)),
+  is_default: z.boolean().optional(),
+});
+
+export const companyFields: FieldDef[] = [
+  { key: "name", label: "Company Name", colSpan: 2 },
+  { key: "vat_number", label: "VAT Number" },
+  { key: "pan", label: "PAN" },
+  { key: "email", label: "Email", type: "email" },
+  { key: "phone", label: "Phone" },
+  { key: "state", label: "State" },
+  { key: "city", label: "City" },
+  { key: "pincode", label: "Pincode" },
+  { key: "address", label: "Address", type: "textarea", colSpan: 2 },
+  { key: "is_default", label: "Default company", type: "switch" },
+];
+
+export const customerSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  vat_number: opt,
+  contact_person: opt,
+  email: z.string().email().optional().or(z.literal("").transform(() => undefined)),
+  phone: opt,
+  state: opt,
+  city: opt,
+  pincode: opt,
+  billing_address: opt,
+});
+export const customerFields: FieldDef[] = [
+  { key: "name", label: "Customer Name", colSpan: 2 },
+  { key: "vat_number", label: "VAT Number" },
+  { key: "contact_person", label: "Contact Person" },
+  { key: "email", label: "Email", type: "email" },
+  { key: "phone", label: "Phone" },
+  { key: "state", label: "State" },
+  { key: "city", label: "City" },
+  { key: "pincode", label: "Pincode" },
+  { key: "billing_address", label: "Billing Address", type: "textarea", colSpan: 2 },
+];
+
+export const vendorSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  vat_number: opt,
+  pan: opt,
+  contact_person: opt,
+  email: z.string().email().optional().or(z.literal("").transform(() => undefined)),
+  phone: opt,
+  state: opt,
+  city: opt,
+  pincode: opt,
+  address: opt,
+  payment_terms: opt,
+});
+export const vendorFields: FieldDef[] = [
+  { key: "name", label: "Vendor Name", colSpan: 2 },
+  { key: "vat_number", label: "VAT Number" },
+  { key: "pan", label: "PAN" },
+  { key: "contact_person", label: "Contact Person" },
+  { key: "email", label: "Email", type: "email" },
+  { key: "phone", label: "Phone" },
+  { key: "state", label: "State" },
+  { key: "city", label: "City" },
+  { key: "pincode", label: "Pincode" },
+  { key: "payment_terms", label: "Payment Terms", placeholder: "Net 30" },
+  { key: "address", label: "Address", type: "textarea", colSpan: 2 },
+];
+
+export const itemSchema = z.object({
+  item_code: z.string().trim().min(1, "Code required").max(50),
+  item_name: z.string().trim().min(1, "Name required").max(200),
+  uom: z.string().trim().min(1).default("NOS"),
+  hsn_code: opt,
+  default_rate: z.coerce.number().min(0).default(0),
+  vat_rate: z.coerce.number().min(0).max(100).default(5),
+  qty: z.coerce.number().min(0).default(0),
+  selling_price: z.coerce.number().min(0).default(0),
+  reorder_level: z.coerce.number().min(0).default(0),
+  warehouse: opt,
+  status: opt,
+  alt_uom: opt,
+  alt_uom_conversion: z.coerce.number().min(0).optional(),
+  is_service: z.boolean().optional(),
+  description: opt,
+});
+export const itemFields: FieldDef[] = [
+  { key: "item_code", label: "Item Code" },
+  { key: "item_name", label: "Item Name" },
+  { key: "uom", label: "Unit", placeholder: "Kg, Piece, Box, Liter…" },
+  { key: "hsn_code", label: "HSN / SAC Code" },
+  { key: "default_rate", label: "Purchase Price", type: "number" },
+  { key: "vat_rate", label: "VAT %", type: "number" },
+  { key: "qty", label: "Quantity", type: "number" },
+  { key: "selling_price", label: "Selling Price", type: "number" },
+  { key: "reorder_level", label: "Reorder Level", type: "number" },
+  {
+    key: "warehouse",
+    label: "Warehouse",
+    type: "select",
+    options: ["Main Warehouse", "Store Room", "Office", "Site"],
+    placeholder: "Select warehouse",
+  },
+  {
+    key: "status",
+    label: "Status",
+    type: "select",
+    options: ["Active", "Inactive"],
+  },
+  { key: "alt_uom", label: "Alt UOM", placeholder: "BOX, CASE, DOZEN…" },
+  { key: "alt_uom_conversion", label: "1 Main = X Alt", type: "number", placeholder: "e.g., 12" },
+  { key: "is_service", label: "This is a service", type: "switch" },
+  { key: "description", label: "Description", type: "textarea", colSpan: 2 },
+];
+
+export const fixedAssetSchema = z.object({
+  asset_code: z.string().trim().min(1).max(50),
+  asset_name: z.string().trim().min(1).max(200),
+  category: opt,
+  uom: z.string().trim().min(1).default("NOS"),
+  hsn_code: opt,
+  pan: opt,
+  qty: z.coerce.number().int().min(0).default(0),
+  purchase_date: opt,
+  purchase_cost: z.coerce.number().min(0).default(0),
+  total_cost: z.coerce.number().min(0).default(0),
+  default_rate: z.coerce.number().min(0).default(0),
+  vat_rate: z.coerce.number().min(0).max(100).default(5),
+  depreciation_method: opt,
+  depreciation_rate: z.coerce.number().min(0).max(100).optional(),
+  status: opt,
+  description: opt,
+});
+export const fixedAssetFields: FieldDef[] = [
+  { key: "asset_code", label: "Asset Code" },
+  { key: "asset_name", label: "Asset Name" },
+  {
+    key: "category",
+    label: "Category",
+    type: "select",
+    options: ["Furniture", "Vehicle", "Computer", "Machinery", "Building", "Land", "Other"],
+    placeholder: "Select category",
+  },
+  { key: "uom", label: "Unit" },
+  { key: "hsn_code", label: "HSN Code" },
+  { key: "pan", label: "PAN" },
+  { key: "qty", label: "Quantity", type: "number" },
+  { key: "purchase_date", label: "Purchase Date", placeholder: "YYYY-MM-DD" },
+  { key: "purchase_cost", label: "Purchase Cost", type: "number" },
+  { key: "total_cost", label: "Total Cost", type: "number" },
+  { key: "default_rate", label: "Rate", type: "number" },
+  { key: "vat_rate", label: "VAT %", type: "number" },
+  {
+    key: "depreciation_method",
+    label: "Depreciation Method",
+    type: "select",
+    options: ["Straight Line", "Declining Balance", "Units of Production"],
+    placeholder: "Select method",
+  },
+  { key: "depreciation_rate", label: "Depreciation %", type: "number" },
+  {
+    key: "status",
+    label: "Status",
+    type: "select",
+    options: ["Active", "Disposed"],
+  },
+  { key: "description", label: "Description", type: "textarea", colSpan: 2 },
+];
