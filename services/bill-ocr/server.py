@@ -354,6 +354,8 @@ def _parse_bill_fields(text: str) -> dict:
         ]
         for pat in patterns_to_remove:
             text = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
+        # Remove trailing batch/shelf codes like "B1", "A2", "C3"
+        text = re.sub(r"\s+[A-Z]\d+\s*$", "", text).strip()
         text = re.sub(r"\n+", " ", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
         if len(text) > 60:
@@ -365,6 +367,7 @@ def _parse_bill_fields(text: str) -> dict:
 
         When OCR merges two numbers, the result has too many decimal groups.
         Tries every character-level split point and picks the best one.
+        Also tries removing each dot (OCR often replaces spaces with dots).
         """
         if not s:
             return []
@@ -372,15 +375,48 @@ def _parse_bill_fields(text: str) -> dict:
         try:
             val = float(clean)
         except ValueError:
-            return []
+            val = None
 
         parts = clean.split(".")
-        if len(parts) <= 2:
+        if len(parts) <= 2 and val is not None:
             return [val]
 
-        # 3+ dots → try every possible split position in the string
+        def _score_split(l_val, r_val, left_str, right_str):
+            score = 0
+            left_dec = len(left_str.split(".")[-1]) if "." in left_str else 0
+            right_dec = len(right_str.split(".")[-1]) if "." in right_str else 0
+            if left_dec == 2 and right_dec <= 1:
+                score += 15
+            elif left_dec == 2 and right_dec == 2:
+                score += 8
+            elif left_dec == 0 and right_dec == 0:
+                score += 5
+            if right_dec >= 3:
+                score -= 20
+            if 1 <= l_val <= 10000:
+                score += 5
+            elif 10000 < l_val <= 50000:
+                score += 2
+            elif l_val > 50000:
+                score -= (l_val - 50000) / 5000
+            if 1 <= r_val <= 100000:
+                score += 5
+            elif 100000 < r_val <= 500000:
+                score += 2
+            elif r_val > 500000:
+                score -= (r_val - 100000) / 10000
+            if l_val > 0 and r_val > 0:
+                ratio = r_val / l_val
+                if 1 <= ratio <= 100:
+                    score += 3
+                elif ratio > 100:
+                    score -= 3
+            return score
+
         best = None
-        best_score = float("inf")
+        best_score = float("-inf")
+
+        # Try 1: direct character-level splits
         for i in range(1, len(clean)):
             left_str = clean[:i]
             right_str = clean[i:]
@@ -391,34 +427,48 @@ def _parse_bill_fields(text: str) -> dict:
                 continue
             if l_val <= 0 or r_val <= 0:
                 continue
-            # Score based on typical bill number patterns:
-            # rate: usually has 2 decimal places, amount: 0-2 decimal places
-            score = 0
-            left_has_2dec = "." in left_str and len(left_str.split(".")[-1]) == 2
-            right_has_01dec = "." in right_str and len(right_str.split(".")[-1]) <= 1
-            if left_has_2dec and right_has_01dec:
-                score -= 10  # strong preference
-            # Penalize unreasonable ranges
-            if l_val > 50000:
-                score += (l_val - 25000) / 1000
-            if r_val > 100000:
-                score += (r_val - 50000) / 1000
-            if 1 <= l_val <= 50000 and 1 <= r_val <= 100000:
-                score -= 5
-            if score < best_score:
+            score = _score_split(l_val, r_val, left_str, right_str)
+            if score > best_score:
                 best_score = score
                 best = (l_val, r_val)
 
+        # Try 2: remove each dot, then try character-level splits
+        if best is None or best_score < 10:
+            dot_positions = [i for i, c in enumerate(clean) if c == "."]
+            for dot_idx in dot_positions:
+                candidate = clean[:dot_idx] + clean[dot_idx + 1:]
+                for i in range(1, len(candidate)):
+                    left_str = candidate[:i]
+                    right_str = candidate[i:]
+                    try:
+                        l_val = float(left_str)
+                        r_val = float(right_str)
+                    except ValueError:
+                        continue
+                    if l_val <= 0 or r_val <= 0:
+                        continue
+                    score = _score_split(l_val, r_val, left_str, right_str)
+                    if score > best_score:
+                        best_score = score
+                        best = (l_val, r_val)
+
         if best:
             return [best[0], best[1]]
-        return [val]
+        return [val] if val is not None else []
 
     def _parse_numbers_from_text(text: str) -> list[float]:
         """Extract all numbers from a text string, splitting merged ones.
         Captures full number strings including multiple dots."""
         raw_nums = []
-        for m in re.finditer(r"(?<![A-Za-z])(\d[\d,]*(?:\.\d+)*)\b", text):
-            raw_nums.append(m.group(1))
+        for m in re.finditer(r"(?<![A-Za-z0-9])(\d[\d,]*(?:\.\d+)*)\b", text):
+            num_str = m.group(1)
+            # Skip single digits that are likely item prefixes (e.g., "1" from "1).")
+            if len(num_str) == 1 and not re.search(r"\d+\)", text):
+                continue
+            raw_nums.append(num_str)
+        # Also catch leading-dot decimals like ".28" (from split position)
+        for m in re.finditer(r"(?<![A-Za-z0-9])\.(\d+)\b", text):
+            raw_nums.append("0." + m.group(1))
         result = []
         for n in raw_nums:
             result.extend(_split_merged_number(n))
@@ -476,7 +526,7 @@ def _parse_bill_fields(text: str) -> dict:
 
     # Numbered items: "N) DESCRIPTION qty rate amount" (with or without colon)
     if not line_items:
-        same_line_items = re.findall(r"\d+\)\s+(.+?):?\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)", full_text)
+        same_line_items = re.findall(r"\d+\)[\.]?\s+(.+?):?\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)", full_text)
         for desc, qty_str, rate_str, amt_str in same_line_items:
             try:
                 qty = float(qty_str.replace(",", ""))
@@ -500,8 +550,15 @@ def _parse_bill_fields(text: str) -> dict:
                 # Extract description (text before first digit)
                 desc_match = re.match(r"([A-Za-z][A-Za-z\d\s.,/&'-]+?)(?:\s+\d|\s*$)", desc_line)
                 desc = clean_desc(desc_match.group(1)) if desc_match else ""
-                # Get numbers from this line
-                nums = _parse_numbers_from_text(desc_line)
+                # Get numbers from AFTER the description match
+                remaining = desc_line[desc_match.end():].strip() if desc_match else desc_line
+                nums = _parse_numbers_from_text(remaining)
+                # If fewer than 3 numbers, also check full desc_line (for single-line cases)
+                if len(nums) < 3:
+                    all_nums = _parse_numbers_from_text(desc_line)
+                    # Use all_nums but skip any that appeared before remaining
+                    if len(all_nums) > len(nums):
+                        nums = all_nums
                 # If fewer than 3 numbers, look at the next line for more
                 if len(nums) < 3:
                     next_line_start = m.end()
@@ -521,41 +578,53 @@ def _parse_bill_fields(text: str) -> dict:
                         })
 
     # Numbered items: description on one line, numbers on next
-    if not line_items:
-        item_chunks = re.split(r"\n\s*\d+\)\.\s*|\n\s*\d+\)\s+", full_text)
-        if len(item_chunks) > 1:
-            for chunk in item_chunks[1:]:
-                chunk_lines = chunk.strip().split("\n")
-                desc_lines = []
-                all_numbers = []
-                found_first_number = False
-                for line in chunk_lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.lower() in ("qty", "netrate", "netamt", "particulars", "qty.", "rate", "amount", "s.n."):
-                        continue
-                    if re.search(r"(hscode|pan\s*no)", line, re.IGNORECASE):
-                        continue
-                    is_number_only = bool(re.match(r"^[\d,\. \-]+$", line))
-                    if is_number_only:
-                        nums = _parse_numbers_from_text(line)
-                        if nums:
+    item_chunks = re.split(r"\n\s*\d+\)\.\s*|\n\s*\d+\)\s+", full_text)
+    if len(item_chunks) > 1:
+        for chunk in item_chunks[1:]:
+            chunk_lines = chunk.strip().split("\n")
+            desc_lines = []
+            all_numbers = []
+            found_first_number = False
+            pending_qty = None  # carry qty from line with only 1 number
+            for line in chunk_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.lower() in ("qty", "netrate", "netamt", "particulars", "qty.", "rate", "amount", "s.n."):
+                    continue
+                if re.search(r"(hscode|pan\s*no|nettotal|grosstant|taxable|tax\s*collected|grand\s*total|tax\s*description|discount|promo|exempted)", line, re.IGNORECASE):
+                    continue
+                is_number_only = bool(re.match(r"^[\d,\. \-]+$", line))
+                if is_number_only:
+                    nums = _parse_numbers_from_text(line)
+                    if nums:
+                        if len(nums) == 1 and pending_qty is None:
+                            # Line has only 1 number — likely qty, carry it forward
+                            pending_qty = nums[0]
+                        else:
                             all_numbers.extend(nums)
                             found_first_number = True
-                    elif not found_first_number and len(desc_lines) < 2:
-                        clean = clean_desc(line)
-                        if clean:
-                            desc_lines.append(clean)
+                elif not found_first_number and len(desc_lines) < 2:
+                    clean = clean_desc(line)
+                    if clean:
+                        desc_lines.append(clean)
 
-                desc = " ".join(desc_lines).strip()
+            desc = " ".join(desc_lines).strip()
 
-                if len(all_numbers) >= 3:
-                    qty = all_numbers[0]
-                    rate = all_numbers[1]
-                    amt = all_numbers[2]
-                    if qty > 0 and amt > 0:
-                        per_unit = round(amt / qty, 2) if qty > 0 else rate
+            # Prepend carried qty if we have it and numbers need it
+            if pending_qty is not None and len(all_numbers) == 2:
+                # We have rate+amount from merged split, need to prepend qty
+                all_numbers = [pending_qty] + all_numbers
+
+            if len(all_numbers) >= 3:
+                qty = all_numbers[0]
+                rate = all_numbers[1]
+                amt = all_numbers[2]
+                if qty > 0 and amt > 0:
+                    per_unit = round(amt / qty, 2) if qty > 0 else rate
+                    # Avoid duplicates
+                    is_dup = any(abs(lt["total"] - amt) < 0.01 and lt["description"] == (desc[:100] if desc else "Item") for lt in line_items)
+                    if not is_dup:
                         line_items.append({
                             "description": desc[:100] if desc else "Item",
                             "quantity": qty,
@@ -682,6 +751,16 @@ def _parse_bill_fields(text: str) -> dict:
             "rate": total,
             "total": total,
         })
+
+    # Deduplicate line items (same amount = same item, keep first match)
+    seen_amounts = set()
+    unique_items = []
+    for item in line_items:
+        key = round(item["total"], 2)
+        if key not in seen_amounts:
+            seen_amounts.add(key)
+            unique_items.append(item)
+    line_items = unique_items
 
     # Parse tax summary table
     exempted_total_from_summary = 0.0
