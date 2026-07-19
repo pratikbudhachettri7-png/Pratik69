@@ -5,21 +5,23 @@ const InputSchema = z.object({
   file_base64: z.string().min(10),
   mime_type: z.string(),
   bill_type: z.enum(["items", "services", "fixed_assets"]),
+  bill_id: z.string().optional(),
 });
 
 const OutputSchema = z.object({
   vendor_name: z.string().nullable(),
   vendor_vat_number: z.string().nullable(),
   vendor_pan: z.string().nullable(),
-  tax_type: z.string().nullable(),
   vendor_address: z.string().nullable(),
   vendor_phone: z.string().nullable(),
   vendor_email: z.string().nullable(),
   vendor_state: z.string().nullable(),
   vendor_city: z.string().nullable(),
   vendor_pincode: z.string().nullable(),
+  tax_type: z.string().nullable(),
   bill_number: z.string().nullable(),
   invoice_date: z.string().nullable(),
+  due_date: z.string().nullable(),
   po_number: z.string().nullable(),
   lines: z.array(
     z.object({
@@ -40,20 +42,58 @@ const OutputSchema = z.object({
   other_charges: z.number().nullable(),
   vat_amount: z.number().nullable(),
   final_amount: z.number().nullable(),
+  raw_text: z.string().nullable(),
+  validation_errors: z.array(z.string()).nullable(),
 });
 
+const serviceUrl = process.env.BILL_OCR_SERVICE_URL || "http://localhost:8001";
+
+function mapExtractedToOutput(ex: any, raw_text: string | null): z.infer<typeof OutputSchema> {
+  return {
+    vendor_name: ex.vendor_name || null,
+    vendor_vat_number: ex.vendor_vat_number || null,
+    vendor_pan: ex.vendor_pan || null,
+    vendor_address: ex.vendor_address || null,
+    vendor_phone: ex.vendor_phone || null,
+    vendor_email: ex.vendor_email || null,
+    vendor_state: ex.vendor_state || null,
+    vendor_city: ex.vendor_city || null,
+    vendor_pincode: ex.vendor_pincode || null,
+    tax_type: "vat",
+    bill_number: ex.bill_number || null,
+    invoice_date: ex.issue_date || null,
+    due_date: ex.due_date || null,
+    po_number: ex.po_number || null,
+    lines: (ex.line_items || []).map((item: any) => ({
+      code: item.account || null,
+      name: item.description || "Item",
+      uom: item.uom || "NOS",
+      quantity: item.quantity || 1,
+      per_unit: item.rate || 0,
+      vat_rate: item.vat_rate || null,
+      lot_number: null,
+      expiry_date: null,
+    })),
+    taxable_amount: ex.taxable_amount || null,
+    exempted_amount: null,
+    discount: ex.discount || null,
+    transportation: ex.transportation || null,
+    other_charges: ex.other_charges || null,
+    vat_amount: ex.tax_total || null,
+    final_amount: ex.total || null,
+    raw_text: raw_text || null,
+    validation_errors: ex._validation_errors || null,
+  };
+}
+
 /**
- * Bill OCR Service client
- * Calls the Python Surya OCR microservice via multipart file upload
+ * Synchronous OCR — calls Gemini-powered Python service directly.
  */
 async function callBillOCRService(
   file_base64: string,
   mime_type: string,
   _bill_type: string,
 ): Promise<z.infer<typeof OutputSchema>> {
-  const serviceUrl = process.env.BILL_OCR_SERVICE_URL || "http://localhost:8001";
-
-  // Convert base64 to Blob
   const byteString = atob(file_base64.split(",")[1] || file_base64);
   const ab = new ArrayBuffer(byteString.length);
   const ia = new Uint8Array(ab);
@@ -84,69 +124,7 @@ async function callBillOCRService(
     throw new Error(result.error || "Extraction failed");
   }
 
-  const ex = result.extracted;
-
-  // Convert date from DD/MMM/YYYY or DD/MM/YYYY to YYYY-MM-DD
-  function normalizeDate(d: string | null): string | null {
-    if (!d) return null;
-    const months: Record<string, string> = {
-      jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
-      jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
-    };
-    // Try DD/MMM/YYYY
-    let m = d.match(/^(\d{1,2})[\/\-](\w+)[\/\-](\d{2,4})$/);
-    if (m) {
-      const day = m[1].padStart(2, "0");
-      const mon = months[m[2].slice(0, 3).toLowerCase()];
-      const year = m[3].length === 2 ? "20" + m[3] : m[3];
-      if (mon) return `${year}-${mon}-${day}`;
-    }
-    // Try DD/MM/YYYY
-    m = d.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-    if (m) {
-      const day = m[1].padStart(2, "0");
-      const mon = m[2].padStart(2, "0");
-      const year = m[3].length === 2 ? "20" + m[3] : m[3];
-      return `${year}-${mon}-${day}`;
-    }
-    // Try YYYY-MM-DD (already correct)
-    if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
-    return d;
-  }
-
-  // Map Surya OCR response to frontend schema
-  return {
-    vendor_name: ex.vendor_name || null,
-    vendor_vat_number: ex.vendor_vat_number || null,
-    vendor_pan: ex.vendor_pan || null,
-    tax_type: ex.tax_type || "vat",
-    vendor_address: ex.vendor_address || null,
-    vendor_phone: ex.vendor_phone || null,
-    vendor_email: ex.vendor_email || null,
-    vendor_state: ex.vendor_state || null,
-    vendor_city: ex.vendor_city || null,
-    vendor_pincode: ex.vendor_pincode || null,
-    bill_number: ex.bill_number || null,
-    invoice_date: normalizeDate(ex.issue_date),
-    po_number: null,
-    lines: (ex.line_items || []).map((item: any) => ({
-      code: null,
-      name: item.description || "Item",
-      uom: "NOS",
-      quantity: item.quantity || 1,
-      per_unit: item.rate || 0,
-      vat_rate: item.has_vat ? (item.vat_rate || (ex.vat_rate || 0)) : 0,
-      lot_number: null,
-      expiry_date: null,
-    })),
-    taxable_amount: ex.subtotal || null,
-    exempted_amount: ex.exempted_amount || null,
-    discount: ex.discount || null,
-    transportation: ex.transportation || null,
-    other_charges: ex.other_charges || null,
-    vat_amount: ex.tax_total || null,
-    final_amount: ex.total || null,
-  };
+  return mapExtractedToOutput(result.extracted, result.raw_text);
 }
 
 export const extractBillFromFile = createServerFn({ method: "POST" })
@@ -158,18 +136,21 @@ export const extractBillFromFile = createServerFn({ method: "POST" })
         data.mime_type,
         data.bill_type,
       );
-
-      // Clamp lines to 40
-      return { ...output, lines: (output.lines ?? []).slice(0, 40) };
+      return output;
     } catch (error) {
-      // Re-throw with user-friendly message
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("Could not extract text")) {
         throw new Error(
           "Couldn't read the bill automatically. Please ensure the image is clear and try again.",
         );
       }
-      throw new Error(`Bill extraction failed: ${message}`);
+      if (message.includes("503") || message.includes("UNAVAILABLE") || message.includes("busy")) {
+        throw new Error("AI service is temporarily busy. Please try again in a few seconds.");
+      }
+      if (message.includes("429") || message.includes("RESOURCE_EXHAUSTED")) {
+        throw new Error("AI service rate limit reached. Please try again later.");
+      }
+      throw new Error("Bill extraction failed. Please try again or fill manually.");
     }
   });
 
@@ -178,11 +159,8 @@ export const extractBillFromFile = createServerFn({ method: "POST" })
  */
 export async function checkOCRServiceHealth(): Promise<{
   status: string;
-  surya: boolean;
-  ollama: boolean;
+  engine: string;
 }> {
-  const serviceUrl = process.env.BILL_OCR_SERVICE_URL || "http://localhost:8001";
-
   try {
     const response = await fetch(`${serviceUrl}/health`, {
       method: "GET",
@@ -190,11 +168,11 @@ export async function checkOCRServiceHealth(): Promise<{
     });
 
     if (!response.ok) {
-      return { status: "unhealthy", surya: false, ollama: false };
+      return { status: "unhealthy", engine: "unknown" };
     }
 
     return await response.json();
   } catch {
-    return { status: "unreachable", surya: false, ollama: false };
+    return { status: "unreachable", engine: "unknown" };
   }
 }

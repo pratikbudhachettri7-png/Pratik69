@@ -1,8 +1,6 @@
+google-genai
 fastapi
 uvicorn
 python-multipart
 pillow
-pypdfium2
-httpx
-paddlepaddle>=3.2.1
-paddleocr>=3.5.0
+python-dotenv

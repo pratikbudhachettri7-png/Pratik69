@@ -47,7 +47,15 @@ function LedgersPage() {
         .from("ledgers")
         .select("*, vendors(name), bills(bill_number, internal_bill_number)")
         .order("date", { ascending: false });
-      if (error) throw error;
+      if (error) {
+        // If join query fails (e.g. missing FK), fall back to simple query
+        const { data: fallback, error: fbErr } = await supabase
+          .from("ledgers")
+          .select("*")
+          .order("date", { ascending: false });
+        if (fbErr) throw fbErr;
+        return (fallback ?? []) as Array<Record<string, unknown>>;
+      }
       return (data ?? []) as Array<Record<string, unknown>>;
     },
   });

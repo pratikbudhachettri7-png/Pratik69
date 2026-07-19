@@ -1,4 +1,4 @@
-import { createFileRoute, notFound } from "@tanstack/react-router";
+import { createFileRoute, notFound, useLocation } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { BillForm } from "@/components/bills/BillForm";
@@ -16,6 +16,11 @@ export const Route = createFileRoute("/bills/$id")({
 
 function BillDetail() {
   const { id } = Route.useParams();
+  const location = useLocation();
+
+  // Read OCR result from TanStack Router navigation state (passed via navigate({ state }))
+  const pendingOcr = (location.state as unknown as Record<string, unknown> | null)?.ocrResult as Record<string, unknown> | null ?? null;
+
   const q = useQuery({
     queryKey: ["bills", id],
     queryFn: async () => {
@@ -26,6 +31,7 @@ function BillDetail() {
       if (bill.error) throw bill.error;
       if (!bill.data) throw notFound();
       if (lines.error) throw lines.error;
+
       return {
         bill: bill.data as Record<string, unknown>,
         lines: (lines.data ?? []) as Array<Record<string, unknown>>,
@@ -42,5 +48,11 @@ function BillDetail() {
   }
   if (!q.data) return null;
 
-  return <BillForm billId={id} initial={q.data} />;
+  return (
+    <BillForm
+      billId={id}
+      initial={q.data}
+      pendingOcrResult={pendingOcr}
+    />
+  );
 }

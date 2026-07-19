@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { useServerFn } from "@tanstack/react-start";
 import { toast } from "sonner";
 import { Upload, Plus, Trash2, Loader2, CheckCircle2, Save } from "lucide-react";
 
@@ -58,6 +57,16 @@ interface Line {
   expiry_date: string;
 }
 
+function toISODate(dateStr: string | null | undefined): string {
+  if (!dateStr) return "";
+  // DD/MM/YYYY → YYYY-MM-DD
+  const ddmmyyyy = dateStr.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (ddmmyyyy) return `${ddmmyyyy[3]}-${ddmmyyyy[2].padStart(2, "0")}-${ddmmyyyy[1].padStart(2, "0")}`;
+  // Already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+  return dateStr;
+}
+
 interface BillFormProps {
   billId?: string;
   initialType?: BillType;
@@ -65,6 +74,7 @@ interface BillFormProps {
     bill: Record<string, unknown> | null;
     lines: Array<Record<string, unknown>>;
   } | null;
+  pendingOcrResult?: Record<string, unknown> | null;
 }
 
 const TYPE_LABEL: Record<BillType, string> = {
@@ -86,13 +96,35 @@ const emptyLine = (sno: number): Line => ({
   expiry_date: "",
 });
 
-export function BillForm({ billId, initialType = "items", initial }: BillFormProps) {
+export function BillForm({ billId, initialType = "items", initial, pendingOcrResult }: BillFormProps) {
   const navigate = useNavigate();
   const qc = useQueryClient();
-  const extract = useServerFn(extractBillFromFile);
 
   const existing = initial?.bill;
   const isNew = !billId;
+
+  // Apply pending OCR result passed via sessionStorage (after navigate from new-bill page)
+  const pendingOcrAppliedRef = useRef(false);
+  const pendingOcrVendorRef = useRef<Awaited<ReturnType<typeof extractBillFromFile>> | null>(null);
+
+  useEffect(() => {
+    if (pendingOcrResult && !pendingOcrAppliedRef.current) {
+      pendingOcrAppliedRef.current = true;
+      const r = pendingOcrResult as Awaited<ReturnType<typeof extractBillFromFile>>;
+      // Apply header fields immediately (no vendor dependency)
+      applyExtractionHeaders(r);
+      // Store for vendor matching once vendors load
+      pendingOcrVendorRef.current = r;
+      const errs = (pendingOcrResult as any)?.validation_errors;
+      if (errs && errs.length > 0) {
+        setValidationErrors(errs);
+        toast.warning("Some values may be inaccurate — please review highlighted fields.");
+      } else {
+        toast.success("Bill details extracted — please review and edit as needed.");
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingOcrResult]);
 
   const [billType, setBillType] = useState<BillType>(
     (existing?.bill_type as BillType) || initialType,
@@ -162,6 +194,10 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
 
   const [uploading, setUploading] = useState(false);
   const [extracting, setExtracting] = useState(false);
+  const [creatingVendor, setCreatingVendor] = useState(false);
+  const [ocrRawText, setOcrRawText] = useState<string | null>(null);
+  const [showOcrText, setShowOcrText] = useState(false);
+  const [validationErrors, setValidationErrors] = useState<string[] | null>(null);
 
   // Auto-suggest internal bill number for new bills
   useEffect(() => {
@@ -182,6 +218,17 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
       return data ?? [];
     },
   });
+
+  // Deferred vendor matching — runs once vendors data is loaded after OCR
+  useEffect(() => {
+    if (pendingOcrVendorRef.current && vendors.data) {
+      const r = pendingOcrVendorRef.current;
+      pendingOcrVendorRef.current = null;
+      applyExtractionVendor(r);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vendors.data]);
+
   const items = useQuery({
     queryKey: ["items", "list"],
     queryFn: async () => {
@@ -297,41 +344,128 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
       setAttachmentPath(path);
       setAttachmentUrl(signed?.signedUrl ?? null);
 
-      // Extract via AI
-      setExtracting(true);
       const buf = await file.arrayBuffer();
       const base64 = arrayBufferToBase64(buf);
-      const res = await extract({
+
+      // OCR FIRST — before creating any draft bill
+      setExtracting(true);
+      const result = await extractBillFromFile({
         data: {
           file_base64: base64,
           mime_type: file.type || "application/pdf",
           bill_type: billType,
         },
       });
-      applyExtraction(res);
-      toast.success("Bill details extracted — please review and edit as needed.");
+      setExtracting(false);
+
+      // OCR succeeded — create draft and navigate, passing extraction via router state
+      let targetBillId = billId;
+      if (!targetBillId) {
+        const { data: draftBill, error: draftErr } = await supabase
+          .from("bills")
+          .insert({
+            bill_type: billType,
+            status: "draft",
+            company_id: (activeCompany?.id as string) ?? null,
+            attachment_url: signed?.signedUrl ?? null,
+          })
+          .select()
+          .single();
+        if (draftErr) throw draftErr;
+        targetBillId = draftBill.id as string;
+        // Pass OCR result via router state (more reliable than sessionStorage)
+        navigate({
+          to: "/bills/$id",
+          params: { id: targetBillId },
+          state: { ocrResult: result } as any,
+        });
+      } else {
+        // Already on the bill page — apply extraction directly
+        applyExtractionHeaders(result);
+        applyExtractionVendor(result);
+        if (result.validation_errors && result.validation_errors.length > 0) {
+          setValidationErrors(result.validation_errors);
+          toast.warning("Some values may be inaccurate — please review highlighted fields.");
+        } else {
+          toast.success("Bill details extracted — please review and edit as needed.");
+        }
+      }
+
+      setUploading(false);
     } catch (e) {
       toast.error((e as Error).message);
-    } finally {
       setUploading(false);
       setExtracting(false);
     }
   };
 
-  const applyExtraction = (r: Awaited<ReturnType<typeof extractBillFromFile>>) => {
-    if (r.bill_number) setBillNumber(r.bill_number);
-    if (r.invoice_date) setInvoiceDate(r.invoice_date);
-    if (r.po_number) setPoNumber(r.po_number);
-    if (typeof r.exempted_amount === "number") setExempted(r.exempted_amount);
-    if (typeof r.discount === "number") setDiscount(r.discount);
-    if (typeof r.transportation === "number") setTransportation(r.transportation);
-    if (typeof r.other_charges === "number") setOtherCharges(r.other_charges);
-
-    // Store OCR tax type for auto-detection
-    if (r.tax_type) {
-      setOcrTaxType(r.tax_type);
+  const applyExtractionHeaders = (r: Awaited<ReturnType<typeof extractBillFromFile>>) => {
+    // Store OCR results for display
+    if (r.raw_text) {
+      setOcrRawText(r.raw_text);
+      setShowOcrText(true);
     }
 
+    // Store validation errors
+    if (r.validation_errors && r.validation_errors.length > 0) {
+      setValidationErrors(r.validation_errors);
+    } else {
+      setValidationErrors(null);
+    }
+
+    // Auto-fill reliable form fields
+    if (r.bill_number) setBillNumber(r.bill_number);
+    if (r.invoice_date) setInvoiceDate(toISODate(r.invoice_date));
+    if (r.po_number) setPoNumber(r.po_number);
+    if (typeof r.discount === "number") setDiscount(r.discount);
+    if (typeof r.vat_amount === "number") setManualVat(r.vat_amount);
+    if (typeof r.transportation === "number") setTransportation(r.transportation);
+    if (typeof r.other_charges === "number") setOtherCharges(r.other_charges);
+    if (typeof r.exempted_amount === "number") setExempted(r.exempted_amount);
+
+    // Populate line items from OCR, auto-linking to masters
+    if (r.lines && r.lines.length > 0) {
+      const masterList = billTypeRef.current === "fixed_assets"
+        ? (assets.data ?? [])
+        : (items.data ?? []);
+      const nameField = billTypeRef.current === "fixed_assets" ? "asset_name" : "item_name";
+      const codeField = billTypeRef.current === "fixed_assets" ? "asset_code" : "item_code";
+
+      setLines(r.lines.map((l, i) => {
+        // Auto-link: match by code first, then by name
+        let refId: string | null = null;
+        if (l.code) {
+          const byCode = masterList.find((m: Record<string, unknown>) =>
+            (m[codeField] as string)?.toLowerCase() === l.code!.toLowerCase()
+          );
+          if (byCode) refId = byCode.id as string;
+        }
+        if (!refId && l.name) {
+          const normalizedName = l.name.trim().toLowerCase();
+          const byName = masterList.find((m: Record<string, unknown>) =>
+            ((m[nameField] as string) ?? "").trim().toLowerCase() === normalizedName
+          );
+          if (byName) refId = byName.id as string;
+        }
+
+        return {
+          id: crypto.randomUUID(),
+          sno: i + 1,
+          ref_id: refId,
+          code: l.code || "",
+          name: l.name || "",
+          uom: l.uom || "NOS",
+          quantity: l.quantity || 1,
+          per_unit: l.per_unit || 0,
+          vat_rate: l.vat_rate || 0,
+          lot_number: l.lot_number || "",
+          expiry_date: l.expiry_date || "",
+        };
+      }));
+    }
+  };
+
+  const applyExtractionVendor = (r: Awaited<ReturnType<typeof extractBillFromFile>>) => {
     // Vendor matching — validate by VAT/PAN first (strongest match), then by name
     let match = null;
     if (r.vendor_vat_number || r.vendor_pan) {
@@ -349,29 +483,22 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
       );
     }
 
+    // Fuzzy fallback: try contains match
+    if (!match && r.vendor_name) {
+      const nameNorm = r.vendor_name.trim().toLowerCase();
+      match = (vendors.data ?? []).find(
+        (v) => {
+          const vName = (v.name as string).trim().toLowerCase();
+          return vName.includes(nameNorm) || nameNorm.includes(vName);
+        },
+      );
+    }
+
     if (match) {
       setVendorId(match.id as string);
       setVendorRow(match as Record<string, unknown>);
-      // Warn about duplicate bill if same vendor + bill number already exists
-      if (r.bill_number) {
-        (async () => {
-          const { data: existing } = await supabase
-            .from("bills")
-            .select("id, invoice_date, final_amount")
-            .eq("bill_number", r.bill_number)
-            .eq("vendor_id", match.id as string)
-            .maybeSingle();
-          if (existing) {
-            const dateStr = existing.invoice_date ? ` dated ${existing.invoice_date}` : "";
-            toast.warning(
-              `⚠ Duplicate — Bill #${r.bill_number}${dateStr} (₹${existing.final_amount}) already exists for this vendor.`,
-              { duration: 8000 },
-            );
-          }
-        })();
-      }
     } else if (r.vendor_name || r.vendor_vat_number || r.vendor_pan) {
-      // Auto-create vendor if not matched
+      setCreatingVendor(true);
       (async () => {
         try {
           const finalName = r.vendor_name?.trim() || `Vendor (VAT/PAN: ${r.vendor_vat_number || r.vendor_pan})`;
@@ -398,105 +525,10 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
           toast.success(`Vendor "${finalName}" created`);
         } catch (e) {
           toast.error(`Failed to create vendor: ${(e as Error).message}`);
+        } finally {
+          setCreatingVendor(false);
         }
       })();
-    }
-
-    // Lines
-    if (r.lines?.length) {
-      const source = (billTypeRef.current === "fixed_assets" ? (assets.data ?? []) : (items.data ?? [])) as Array<Record<string, unknown>>;
-      const codeKey = billTypeRef.current === "fixed_assets" ? "asset_code" : "item_code";
-      const nameKey = billTypeRef.current === "fixed_assets" ? "asset_name" : "item_name";
-      const mapped: Line[] = r.lines.map((ln, i) => {
-        const match = source.find(
-          (s) =>
-            (ln.code &&
-              (s[codeKey] as string | undefined)?.toLowerCase() === ln.code.toLowerCase()) ||
-            (ln.name && (s[nameKey] as string | undefined)?.toLowerCase() === ln.name.toLowerCase()),
-        );
-        return {
-          sno: i + 1,
-          ref_id: (match?.id as string) ?? null,
-          code: ln.code ?? (match?.[codeKey] as string) ?? "",
-          name: ln.name || ((match?.[nameKey] as string) ?? ""),
-          uom: ln.uom ?? (match?.uom as string) ?? "NOS",
-          quantity: Number(ln.quantity) || 1,
-          per_unit: Number(ln.per_unit) || 0,
-          vat_rate: Number(ln.vat_rate ?? (match?.vat_rate as number) ?? 0),
-          lot_number: (ln.lot_number as string) ?? "",
-          expiry_date: (ln.expiry_date as string) ?? "",
-        };
-      });
-      setLines(mapped);
-
-      // Auto-create items/assets that don't exist in master
-      const unmatched = mapped.filter((l) => !l.ref_id && l.name.trim());
-      if (unmatched.length) {
-        (async () => {
-          const table = billTypeRef.current === "fixed_assets" ? "fixed_assets" : "items";
-          const codeField = billTypeRef.current === "fixed_assets" ? "asset_code" : "item_code";
-          const nameField = billTypeRef.current === "fixed_assets" ? "asset_name" : "item_name";
-          const updatedLines = [...mapped];
-
-          for (const line of unmatched) {
-            const autoCode = line.name
-              .trim()
-              .toUpperCase()
-              .replace(/[^A-Z0-9 ]/g, "")
-              .replace(/\s+/g, "-")
-              .slice(0, 50);
-
-            // Check for existing item/asset by code OR name (case-insensitive)
-            const { data: existing } = await supabase
-              .from(table)
-              .select("id, qty")
-              .or(`${codeField}.eq.${autoCode},${nameField}.eq.${line.name.trim()}`)
-              .maybeSingle();
-
-            if (existing) {
-              // Update qty: existing + new
-              const newQty = Number(existing.qty || 0) + Number(line.quantity || 1);
-              await supabase
-                .from(table)
-                .update({ qty: newQty } as never)
-                .eq("id", existing.id);
-              const idx = updatedLines.findIndex((l) => l.name === line.name && !l.ref_id);
-              if (idx >= 0) {
-                updatedLines[idx] = { ...updatedLines[idx], ref_id: existing.id as string };
-              }
-              qc.invalidateQueries({ queryKey: [table] });
-              toast.success(`"${line.name}" qty updated to ${newQty}`);
-            } else {
-              // Insert new record
-              const payload: Record<string, unknown> = {
-                [codeField]: autoCode,
-                [nameField]: line.name.trim(),
-                uom: line.uom || "NOS",
-                default_rate: line.per_unit,
-                vat_rate: line.vat_rate,
-                qty: Number(line.quantity) || 1,
-              };
-
-              const { data: newItem, error } = await supabase
-                .from(table)
-                .insert(payload as never)
-                .select()
-                .single();
-
-              if (!error && newItem) {
-                const idx = updatedLines.findIndex((l) => l.name === line.name && !l.ref_id);
-                if (idx >= 0) {
-                  updatedLines[idx] = { ...updatedLines[idx], ref_id: newItem.id as string };
-                }
-                qc.invalidateQueries({ queryKey: [table] });
-                toast.success(`"${line.name}" added to ${billTypeRef.current === "fixed_assets" ? "fixed assets" : "inventory"}`);
-              }
-            }
-          }
-
-          setLines(updatedLines);
-        })();
-      }
     }
   };
 
@@ -504,7 +536,6 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
     mutationFn: async (opts: { approve: boolean }) => {
       const payload = {
         bill_type: billType,
-        tax_type: taxType,
         vendor_id: vendorId,
         company_id: (activeCompany?.id as string) ?? null,
         bill_number: billNumber || null,
@@ -522,31 +553,77 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
         approved_at: opts.approve ? new Date().toISOString() : null,
         attachment_url: attachmentUrl,
         notes: notes || null,
+        extracted_json: (() => {
+          if (!ocrRawText) return null;
+          try { return JSON.parse(ocrRawText); } catch { return { raw: ocrRawText }; }
+        })(),
       };
+
+      // ── Duplicate bill check (runs for BOTH new bills AND first-time saves of OCR drafts) ──
+      if (billNumber) {
+        const candidateVendorIds = new Set<string>();
+        if (vendorId) {
+          candidateVendorIds.add(vendorId);
+          const { data: vRow } = await supabase
+            .from("vendors")
+            .select("vat_number, pan")
+            .eq("id", vendorId)
+            .maybeSingle();
+          // Find vendors with same VAT
+          if (vRow?.vat_number) {
+            const { data: byVat } = await supabase
+              .from("vendors")
+              .select("id")
+              .eq("vat_number", vRow.vat_number);
+            for (const v of byVat ?? []) candidateVendorIds.add(v.id);
+          }
+          // Find vendors with same PAN
+          if (vRow?.pan) {
+            const { data: byPan } = await supabase
+              .from("vendors")
+              .select("id")
+              .eq("pan", vRow.pan);
+            for (const v of byPan ?? []) candidateVendorIds.add(v.id);
+          }
+        }
+
+        // Query 1: same bill_number + vendor_id in candidate set
+        let foundDup: { id: string; bill_number: string | null; invoice_date: string | null; final_amount: number } | null = null;
+        if (candidateVendorIds.size > 0) {
+          const { data } = await supabase
+            .from("bills")
+            .select("id, bill_number, invoice_date, final_amount")
+            .eq("bill_number", billNumber)
+            .in("vendor_id", [...candidateVendorIds])
+            .maybeSingle();
+          if (data && data.id !== billId) foundDup = data;
+        }
+        // Query 2: same bill_number + vendor_id IS NULL (unassigned bills)
+        if (!foundDup) {
+          const { data } = await supabase
+            .from("bills")
+            .select("id, bill_number, invoice_date, final_amount")
+            .eq("bill_number", billNumber)
+            .is("vendor_id", null)
+            .maybeSingle();
+          if (data && data.id !== billId) foundDup = data;
+        }
+
+        if (foundDup) {
+          const dateStr = foundDup.invoice_date ? ` dated ${foundDup.invoice_date}` : "";
+          throw new Error(
+            `Duplicate bill detected — Bill #${billNumber}${dateStr} (₹${foundDup.final_amount}) already exists. ` +
+            `Please review the existing bill before saving.`,
+          );
+        }
+      }
 
       let id = billId;
       if (id) {
         const { error } = await supabase.from("bills").update(payload as never).eq("id", id);
         if (error) throw error;
-        // Replace lines
         await supabase.from("bill_lines").delete().eq("bill_id", id);
       } else {
-        // Duplicate check: same vendor (VAT/PAN) + same bill number
-        if (vendorId && billNumber) {
-          const { data: existing } = await supabase
-            .from("bills")
-            .select("id, bill_number, invoice_date, final_amount")
-            .eq("bill_number", billNumber)
-            .eq("vendor_id", vendorId)
-            .maybeSingle();
-          if (existing) {
-            const dateStr = existing.invoice_date ? ` dated ${existing.invoice_date}` : "";
-            throw new Error(
-              `Duplicate bill detected — Bill #${billNumber}${dateStr} (₹${existing.final_amount}) already exists. ` +
-              `Please review the existing bill before saving.`,
-            );
-          }
-        }
         const { data, error } = await supabase
           .from("bills")
           .insert(payload as never)
@@ -607,67 +684,116 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
       qc.invalidateQueries({ queryKey: ["ledgers"] });
       toast.success(vars.approve ? "Bill approved & saved" : "Draft saved");
 
-      // Prompt to add unmatched line items to master
-      const unmatched = lines.filter((l) => !l.ref_id && l.name.trim());
-      if (unmatched.length) {
-        const table = billTypeRef.current === "fixed_assets" ? "fixed_assets" : "items";
-        const codeField = billTypeRef.current === "fixed_assets" ? "asset_code" : "item_code";
-        const nameField = billTypeRef.current === "fixed_assets" ? "asset_name" : "item_name";
-        const label = billTypeRef.current === "fixed_assets" ? "fixed assets" : "inventory";
+      // Auto-create master records on approve (inventory, services, fixed assets)
+      if (vars.approve) {
+        const isFixedAssets = billTypeRef.current === "fixed_assets";
+        const isServices = billTypeRef.current === "services";
+        const table = isFixedAssets ? "fixed_assets" : "items";
+        const codeField = isFixedAssets ? "asset_code" : "item_code";
+        const nameField = isFixedAssets ? "asset_name" : "item_name";
+        const label = isFixedAssets ? "fixed assets" : isServices ? "services" : "inventory";
 
-        toast.info(
-          `${unmatched.length} item(s) not in ${label}: ${unmatched.map((l) => l.name).join(", ")}`,
-          {
-            duration: 10000,
-            action: {
-              label: `Add to ${label}`,
-              onClick: async () => {
-                for (const line of unmatched) {
-                  const autoCode = line.name
-                    .trim()
-                    .toUpperCase()
-                    .replace(/[^A-Z0-9 ]/g, "")
-                    .replace(/\s+/g, "-")
-                    .slice(0, 50);
+        (async () => {
+          let created = 0;
+          let updated = 0;
 
-                  // Check for existing item/asset by code OR name
-                  const { data: existing } = await supabase
-                    .from(table)
-                    .select("id, qty")
-                    .or(`${codeField}.eq.${autoCode},${nameField}.eq.${line.name.trim()}`)
-                    .maybeSingle();
+          // ── 1. Increment qty for MATCHED lines (ref_id is set) ──
+          const matched = lines.filter((l) => l.ref_id && l.name.trim());
+          for (const line of matched) {
+            const { data: item } = await supabase
+              .from(table)
+              .select("id, qty")
+              .eq("id", line.ref_id!)
+              .maybeSingle();
+            if (item) {
+              const newQty = Number(item.qty || 0) + Number(line.quantity || 0);
+              await supabase
+                .from(table)
+                .update({ qty: newQty } as never)
+                .eq("id", item.id);
+              updated++;
+            }
+          }
 
-                  if (existing) {
-                    const newQty = Number(existing.qty || 0) + Number(line.quantity || 1);
-                    await supabase
-                      .from(table)
-                      .update({ qty: newQty } as never)
-                      .eq("id", existing.id);
-                    toast.success(`"${line.name}" qty updated to ${newQty}`);
-                  } else {
-                    const payload: Record<string, unknown> = {
-                      [codeField]: autoCode,
-                      [nameField]: line.name.trim(),
-                      uom: line.uom || "NOS",
-                      default_rate: line.per_unit,
-                      vat_rate: line.vat_rate,
-                      qty: Number(line.quantity) || 1,
-                    };
+          // ── 2. Create or update UNMATCHED lines (no ref_id) ──
+          const unmatched = lines.filter((l) => !l.ref_id && l.name.trim());
+          for (const line of unmatched) {
+            const autoCode = line.name
+              .trim()
+              .toUpperCase()
+              .replace(/[^A-Z0-9 ]/g, "")
+              .replace(/\s+/g, "-")
+              .slice(0, 50);
 
-                    const { error } = await supabase
-                      .from(table)
-                      .insert(payload as never);
+            // Normalize name for fuzzy matching: collapse spaces, lowercase
+            const normalizedInput = line.name.trim().toLowerCase().replace(/\s+/g, " ");
+            const normalizedName = (n: string) => n.trim().toLowerCase().replace(/\s+/g, " ");
 
-                    if (!error) {
-                      toast.success(`"${line.name}" added to ${label}`);
-                    }
-                  }
-                }
-                qc.invalidateQueries({ queryKey: [table] });
-              },
-            },
-          },
-        );
+            // For items/services table, also filter by is_service to avoid cross-matching
+            const { data: existingCandidates } = await supabase
+              .from(table)
+              .select("id, qty, is_service")
+              .or(`${codeField}.eq.${autoCode},${nameField}.eq.${line.name.trim()}`);
+
+            // Filter by is_service client-side (generated types may not include it in .eq)
+            let existing = isFixedAssets
+              ? existingCandidates?.[0] ?? null
+              : (existingCandidates as any)?.find((r: any) => r.is_service === isServices) ?? null;
+
+            // Fuzzy fallback: try normalized name match if exact match failed
+            if (!existing && !isFixedAssets) {
+              const fuzzyCandidates = await supabase
+                .from(table)
+                .select("id, qty, is_service, item_name")
+                .like("item_name", `%${line.name.trim().split(/\s+/)[0]}%`);
+              const candidates = (fuzzyCandidates.data ?? []) as any[];
+              existing = candidates.find((r) =>
+                r.is_service === isServices &&
+                normalizedName(r.item_name).replace(/\s+/g, " ") === normalizedInput
+              ) ?? null;
+            }
+
+            if (existing) {
+              const newQty = Number(existing.qty || 0) + Number(line.quantity || 1);
+              await supabase
+                .from(table)
+                .update({ qty: newQty } as never)
+                .eq("id", existing.id);
+              updated++;
+            } else {
+              const payload: Record<string, unknown> = {
+                [codeField]: autoCode,
+                [nameField]: line.name.trim(),
+                uom: line.uom || "NOS",
+                default_rate: line.per_unit,
+                vat_rate: line.vat_rate,
+                qty: Number(line.quantity) || 1,
+              };
+              // Mark as service
+              if (!isFixedAssets) {
+                payload.is_service = isServices;
+              }
+              // Add purchase fields for fixed assets
+              if (isFixedAssets) {
+                payload.purchase_date = invoiceDate || null;
+                payload.purchase_cost = line.per_unit;
+                payload.total_cost = computeLineAmount(line.quantity, line.per_unit);
+                payload.category = "Other";
+              }
+              const { error } = await supabase
+                .from(table)
+                .insert(payload as never);
+              if (!error) created++;
+            }
+          }
+          qc.invalidateQueries({ queryKey: [table] });
+          if (created || updated) {
+            const parts = [];
+            if (created) parts.push(`${created} new`);
+            if (updated) parts.push(`${updated} qty updated`);
+            toast.success(`${label} ${parts.join(", ")}`);
+          }
+        })();
       }
 
       if (isNew && id) {
@@ -707,13 +833,13 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
             <Button
               variant="outline"
               onClick={() => save.mutate({ approve: false })}
-              disabled={save.isPending}
+              disabled={save.isPending || creatingVendor}
             >
               <Save className="mr-1 h-4 w-4" /> Save Draft
             </Button>
             <Button
               onClick={() => save.mutate({ approve: true })}
-              disabled={save.isPending}
+              disabled={save.isPending || creatingVendor}
             >
               <CheckCircle2 className="mr-1 h-4 w-4" /> Approve &amp; Save
             </Button>
@@ -783,6 +909,9 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
                     onClick={() => {
                       setAttachmentUrl(null);
                       setAttachmentPath(null);
+                      setOcrRawText(null);
+                      setShowOcrText(false);
+                      setValidationErrors(null);
                     }}
                   >
                     Remove
@@ -793,7 +922,53 @@ export function BillForm({ billId, initialType = "items", initial }: BillFormPro
           </CardContent>
         </Card>
 
-        {/* Header */}
+        {/* OCR Extracted Info Panel */}
+        {ocrRawText && (
+          <Card>
+            <CardHeader
+              className="cursor-pointer select-none py-3"
+              onClick={() => setShowOcrText(!showOcrText)}
+            >
+              <CardTitle className="flex items-center justify-between text-base">
+                <span>OCR Extracted Text</span>
+                <span className="text-xs font-normal text-muted-foreground">
+                  {showOcrText ? "Click to collapse" : "Click to expand"}
+                </span>
+              </CardTitle>
+            </CardHeader>
+            {showOcrText && (
+              <CardContent>
+                <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-4 text-xs leading-relaxed">
+                  {ocrRawText}
+                </pre>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Review the extracted text above and fill in the bill details manually below. Vendor and date have been auto-filled where possible.
+                </p>
+              </CardContent>
+            )}
+          </Card>
+        )}
+
+        {/* Validation Errors */}
+        {validationErrors && validationErrors.length > 0 && (
+          <Card className="border-destructive/50 bg-destructive/5">
+            <CardHeader className="py-3">
+              <CardTitle className="text-base text-destructive">
+                Extraction Warnings
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="list-disc space-y-1 pl-4 text-sm text-destructive">
+                {validationErrors.map((err, i) => (
+                  <li key={i}>{err}</li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Some values may be inaccurate. Please review the bill details below and correct any issues before saving.
+              </p>
+            </CardContent>
+          </Card>
+        )}
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Bill Details</CardTitle>
